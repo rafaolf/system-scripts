@@ -34,6 +34,18 @@ This laptop shipped with good hardware but Ubuntu's defaults leave a lot of perf
 
 These scripts fix all of that in four incremental stages, each idempotent and safe to re-run.
 
+## When to run each script
+
+| Script | When to run | Frequency |
+|---|---|---|
+| `01-stabilize-system.sh` | Fresh install or after ZFS/boot issues | Once (idempotent) |
+| `02-optimize-system.sh` | After stabilization | Once (idempotent) |
+| `03-enhance-system.sh` | After optimization | Once (idempotent) |
+| `04-deep-optimize.sh` | After enhancement | Once (idempotent) |
+| `05-fix-kernel-panic.sh` | After a kernel panic or driver regression | As needed |
+| `06-complete-optimization.sh` | After `04` to resolve remaining audit issues | Once (idempotent) |
+| `07-cleanup.sh` | When disk is getting full, or routine maintenance | **Monthly** |
+
 ## Scripts
 
 ### `01-stabilize-system.sh` — Stabilization
@@ -90,6 +102,37 @@ Final round of desktop UX and multimedia improvements.
 | Firefox VA-API | Sets `MOZ_DISABLE_RDD_SANDBOX=1`, `MOZ_ENABLE_WAYLAND=1`, and `user.js` prefs | Firefox snap doesn't enable hardware video decode by default — without this, the CPU decodes all video, wasting power and causing thermal throttling |
 | Backup consolidation | Moves backup dirs from `~` into `system-scripts/` | Keeps the home directory clean |
 
+### `05-fix-kernel-panic.sh` — Kernel Panic Recovery
+
+Run after a kernel panic or GPU driver regression to roll back problematic changes and restore a stable configuration.
+
+### `06-complete-optimization.sh` — Complete Optimization
+
+Second-pass fixes for issues discovered during a full system audit after running scripts 01–04.
+
+### `07-cleanup.sh` — Storage Cleanup *(run monthly)*
+
+Reclaims disk space. Safe to run as your own user; some sections (APT, journal, snap) auto-elevate or print the `sudo` command to run separately.
+
+| What | Details |
+|---|---|
+| Trash | Empties `~/.local/share/Trash` |
+| `node_modules` | Removes all `node_modules` dirs in `~/projects` (reinstall with `bun/npm install`) |
+| PHP vendor | Removes `vendor/` dirs next to `composer.json` in `~/projects` |
+| pnpm store | Prunes unreferenced packages from the global pnpm content-addressable store |
+| Docker images | Removes dangling layers and old ddev image versions, prunes build cache and stopped containers |
+| Browser caches | Clears Chrome, Firefox, and Chromium caches |
+| Playwright cache | Removes cached Chromium/Firefox test browser binaries |
+| pip cache | Clears Python package download cache |
+| Homebrew cache | Removes downloaded formula archives |
+| Old installers | Keeps only the latest `.deb` per app in `~/Downloads/programs` |
+| `~/tmp` | Clears all files in `~/tmp` |
+| Journal | Trims systemd journal to 100 MB (requires sudo) |
+| APT cache | Runs `apt-get clean` (requires sudo) |
+| Snap revisions | Removes disabled snap revisions (requires sudo) |
+
+**Not touched:** Docker named volumes (may contain dev databases — remove manually if desired).
+
 ### `04-deep-optimize.sh` — Deep Optimization
 
 Second-pass tuning: swap, IRQs, DNS, IOMMU, and hardware-specific platform integration.
@@ -112,17 +155,27 @@ Second-pass tuning: swap, IRQs, DNS, IOMMU, and hardware-specific platform integ
 
 ## Usage
 
-Each script must be run as root. They are designed to be run in order, but each is idempotent — safe to re-run at any time.
+### One-time setup (run once, in order)
+
+Scripts 01–06 are system configuration scripts. Run as root, in order. Each is idempotent — safe to re-run.
 
 ```bash
 sudo bash 01-stabilize-system.sh
 sudo bash 02-optimize-system.sh
 sudo bash 03-enhance-system.sh
 sudo bash 04-deep-optimize.sh
+sudo bash 06-complete-optimization.sh
 sudo reboot
 ```
 
 Each script creates a timestamped backup of every config file it modifies before making changes.
+
+### Routine maintenance (run monthly)
+
+```bash
+bash 07-cleanup.sh
+# Some sections (APT, journal, snap) require sudo — the script will tell you
+```
 
 ## Post-reboot verification
 
