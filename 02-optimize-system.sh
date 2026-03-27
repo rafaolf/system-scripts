@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # System Performance Optimization — ASUS ROG Zephyrus G14 (GA402RJ)
-# Ubuntu 24.04.4, Kernel 6.17, ZFS root, AMD Ryzen 9 6900HS + RX 6800S
+# Ubuntu 24.04.4, Kernel 6.17, ZFS root, AMD Ryzen 9 6900HS + RX 6700S
 #
 # Usage: sudo bash optimize-system.sh
 # =============================================================================

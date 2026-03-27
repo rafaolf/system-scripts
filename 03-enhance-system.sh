@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # System Enhancement Script — ASUS ROG Zephyrus G14 (GA402RJ)
-# Ubuntu 24.04.4, Kernel 6.17, ZFS root, AMD Ryzen 9 6900HS + RX 6800S
+# Ubuntu 24.04.4, Kernel 6.17, ZFS root, AMD Ryzen 9 6900HS + RX 6700S
 #
 # Covers the final round of optimizations:
 #   1. Disable Tracker file indexer (reduces CPU spikes)
@@ -122,7 +122,7 @@ echo ""
 echo "=== 4. PipeWire Audio Tuning ==="
 
 # Default quantum=1024 at 48kHz = 21.3ms latency.
-# quantum=512 = 10.7ms — noticeably snappier for desktop audio/video,
+# quantum=256 = 5.3ms — tighter audio/video sync for video calls,
 # notifications, browser media. Still very safe for USB audio devices.
 
 PIPEWIRE_CONF_DIR="/home/rafaolf/.config/pipewire/pipewire.conf.d"
@@ -130,18 +130,18 @@ mkdir -p "$PIPEWIRE_CONF_DIR"
 chown -R rafaolf:rafaolf /home/rafaolf/.config/pipewire
 
 cat > "${PIPEWIRE_CONF_DIR}/10-low-latency.conf" <<'EOF'
-# Lower audio latency: 512 samples at 48kHz = 10.7ms (default 1024 = 21.3ms)
+# Lower audio latency: 256 samples at 48kHz = 5.3ms (default 1024 = 21.3ms)
 # Also allow 44.1kHz for lossless audio sources
 context.properties = {
-    default.clock.quantum         = 512
+    default.clock.quantum         = 256
     default.clock.min-quantum     = 64
-    default.clock.max-quantum     = 1024
+    default.clock.max-quantum     = 512
     default.clock.allowed-rates   = [ 44100 48000 96000 ]
 }
 EOF
 
 chown rafaolf:rafaolf "${PIPEWIRE_CONF_DIR}/10-low-latency.conf"
-log "PipeWire quantum=512 (10.7ms latency, effective after reboot or pw restart)"
+log "PipeWire quantum=256 (5.3ms latency, effective after reboot or pw restart)"
 
 # Also tune WirePlumber for faster node switching
 WP_CONF_DIR="/home/rafaolf/.config/wireplumber/wireplumber.conf.d"
@@ -222,10 +222,59 @@ else
 fi
 
 # =============================================================================
-# 6. CONSOLIDATE BACKUPS INTO system-scripts/
+# 6. CHROME VA-API + GPU ROUTING
 # =============================================================================
 echo ""
-echo "=== 6. Consolidating Backups ==="
+echo "=== 6. Chrome Hardware Video Acceleration ==="
+
+# Chrome on Linux does not enable VA-API hardware decode by default.
+# Without explicit flags + GPU routing, it:
+#   - Runs on the iGPU (680M) instead of the dGPU (RX 6700S)
+#   - Decodes VP9/H264/HEVC in software on the CPU (high CPU, fan noise at 1080p)
+#   - Runs under XWayland instead of native Wayland (extra translation layer)
+#
+# chrome-flags.conf is read by the chrome wrapper script automatically.
+# The .desktop override sets environment variables that route Chrome to the
+# dGPU and configure VA-API to use the correct DRM render node.
+
+USER_HOME="/home/rafaolf"
+CHROME_FLAGS_CONF="${USER_HOME}/.config/google-chrome/chrome-flags.conf"
+CHROME_DESKTOP_USER="${USER_HOME}/.local/share/applications/google-chrome.desktop"
+CHROME_DESKTOP_SYSTEM="/usr/share/applications/google-chrome.desktop"
+
+# Chrome flags for hardware acceleration
+mkdir -p "$(dirname "$CHROME_FLAGS_CONF")"
+cat > "$CHROME_FLAGS_CONF" <<'EOF'
+--enable-features=VaapiVideoDecodeLinuxGL,VaapiVideoEncoder,UseOzonePlatform,VaapiVideoDecoder,PlatformHEVCDecoderSupport
+--ozone-platform=wayland
+--enable-gpu-rasterization
+--enable-zero-copy
+--ignore-gpu-blocklist
+EOF
+chown rafaolf:rafaolf "$CHROME_FLAGS_CONF"
+log "Chrome flags: VA-API + native Wayland + GPU rasterization enabled"
+
+# User .desktop override to route Chrome to dGPU via environment variables:
+#   DRI_PRIME         — targets dGPU by exact PCI address (avoids index ambiguity)
+#   LIBVA_DRM_DEVICE  — routes VA-API hardware decode to the dGPU render node
+#   LIBVA_DRIVER_NAME — pins the VA-API driver, prevents iGPU fallback
+#   MESA_VK_DEVICE_SELECT — routes Vulkan (WebRTC paths) to the dGPU
+if [ -f "$CHROME_DESKTOP_SYSTEM" ]; then
+    mkdir -p "$(dirname "$CHROME_DESKTOP_USER")"
+    cp "$CHROME_DESKTOP_SYSTEM" "$CHROME_DESKTOP_USER"
+    GPU_ENV="DRI_PRIME=pci-0000_03_00_0 LIBVA_DRM_DEVICE=/dev/dri/renderD128 LIBVA_DRIVER_NAME=radeonsi MESA_VK_DEVICE_SELECT=1002:73ef"
+    sed -i "s|^Exec=/usr/bin/google-chrome-stable|Exec=env ${GPU_ENV} /usr/bin/google-chrome-stable|g" "$CHROME_DESKTOP_USER"
+    chown rafaolf:rafaolf "$CHROME_DESKTOP_USER"
+    log "Chrome .desktop: all Exec= lines routed to dGPU (DRI_PRIME + LIBVA + MESA_VK)"
+else
+    warn "google-chrome.desktop not found at $CHROME_DESKTOP_SYSTEM — install Chrome first"
+fi
+
+# =============================================================================
+# 7. CONSOLIDATE BACKUPS INTO system-scripts/
+# =============================================================================
+echo ""
+echo "=== 7. Consolidating Backups ==="
 
 for bak in /home/rafaolf/stabilize-backup-* /home/rafaolf/optimize-backup-*; do
     if [ -d "$bak" ]; then
@@ -255,14 +304,16 @@ echo "   - DING extension: disabled"
 echo ""
 echo " Changes requiring reboot/re-login:"
 echo "   - mitigations=off (kernel parameter)"
-echo "   - PipeWire quantum=512 (10.7ms audio latency)"
+echo "   - PipeWire quantum=256 (5.3ms audio latency)"
 echo "   - Firefox snap VA-API environment vars"
+echo "   - Chrome: restart required to pick up dGPU env vars from .desktop"
 echo ""
 echo " All scripts are now in: ${SCRIPT_DIR}/"
 echo ""
 echo " After reboot, verify with:"
 echo "   grep 'mitigations' /proc/cmdline"
-echo "   pw-metadata -n settings 0 | grep quantum"
-echo "   systemctl --user status tracker-miner-fs-3  # should be masked"
-echo "   gnome-extensions list --enabled              # DING should be gone"
+echo "   pw-metadata -n settings 0 | grep quantum          # should be 256"
+echo "   systemctl --user status tracker-miner-fs-3        # should be masked"
+echo "   gnome-extensions list --enabled                   # DING should be gone"
+echo "   chrome://gpu (in Chrome)                          # Video Decode: Hardware accelerated"
 echo ""

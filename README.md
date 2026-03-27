@@ -9,7 +9,7 @@ System optimization scripts for the **ASUS ROG Zephyrus G14 (GA402RJ)**.
 | **Root filesystem** | ZFS (with encrypted swap) |
 | **CPU** | AMD Ryzen 9 6900HS (Zen 3+, 8C/16T) |
 | **GPU (iGPU)** | AMD Rembrandt (RDNA 2 integrated) |
-| **GPU (dGPU)** | AMD Radeon RX 6800S (Navi 23, RDNA 2) |
+| **GPU (dGPU)** | AMD Radeon RX 6700S (Navi 23, RDNA 2) |
 | **RAM** | 24 GB |
 | **Storage** | NVMe SSD |
 | **WiFi** | MediaTek MT7921e |
@@ -45,6 +45,7 @@ These scripts fix all of that in four incremental stages, each idempotent and sa
 | `05-fix-kernel-panic.sh` | After a kernel panic or driver regression | As needed |
 | `06-complete-optimization.sh` | After `04` to resolve remaining audit issues | Once (idempotent) |
 | `07-cleanup.sh` | When disk is getting full, or routine maintenance | **Monthly** |
+| `08-fix-recurring-panic.sh` | After recurring panics traced to amdgpu+ZFS race conditions | As needed |
 
 ## Scripts
 
@@ -98,13 +99,27 @@ Final round of desktop UX and multimedia improvements.
 | Tracker | Masks `tracker-miner-fs-3` and clears the index | Tracker causes periodic CPU spikes scanning the filesystem; GNOME Files browsing still works fine without it |
 | DING extension | Disables Desktop Icons NG | DING spawns a separate process for desktop icons — one of the heavier GNOME extensions, and desktop icons aren't useful on a tiling/workflow setup |
 | `mitigations=off` | Disables Spectre/Meltdown/SRSO kernel mitigations | ~5–15% CPU performance boost; acceptable trade-off on a single-user personal machine where all running software is trusted |
-| PipeWire | `quantum=512` (10.7 ms latency), WirePlumber ALSA headroom tuning | Default 21.3 ms latency is noticeably sluggish for desktop audio, notifications, and video playback |
+| PipeWire | `quantum=256` (5.3 ms latency), WirePlumber ALSA headroom tuning | Default 21.3 ms latency causes audio/video desync in video calls; 5.3 ms eliminates this without stability risk on modern hardware |
 | Firefox VA-API | Sets `MOZ_DISABLE_RDD_SANDBOX=1`, `MOZ_ENABLE_WAYLAND=1`, and `user.js` prefs | Firefox snap doesn't enable hardware video decode by default — without this, the CPU decodes all video, wasting power and causing thermal throttling |
+| Chrome VA-API + GPU routing | Creates `chrome-flags.conf` (VA-API, native Wayland, GPU rasterization) and a user `.desktop` override with `DRI_PRIME`, `LIBVA_DRM_DEVICE`, `LIBVA_DRIVER_NAME`, `MESA_VK_DEVICE_SELECT` | Without this, Chrome renders on the iGPU (680M) and decodes video in software — the root cause of fan noise and lag during 1080p Google Meet calls |
 | Backup consolidation | Moves backup dirs from `~` into `system-scripts/` | Keeps the home directory clean |
 
 ### `05-fix-kernel-panic.sh` — Kernel Panic Recovery
 
 Run after a kernel panic or GPU driver regression to roll back problematic changes and restore a stable configuration.
+
+### `08-fix-recurring-panic.sh` — Recurring Panic Fix
+
+Run after recurring panics identified from post-mortem analysis. Addresses race conditions in amdgpu + ZFS on kernel 6.17.
+
+| Change | What it does | Why |
+|---|---|---|
+| `preempt=full` → `preempt=voluntary` | Downgrades kernel preemption model | Full preemption exposes race conditions between the amdgpu driver and ZFS on experimental kernels; voluntary is still low-latency but avoids the races |
+| ZFS ARC 8 GB → 6 GB | Reduces ARC memory cap | 8 GB left only ~3.9 GB free under heavy desktop load, causing kernel direct reclaim to fight ZFS ARC eviction — a combination that triggers panics on bleeding-edge kernels |
+| `min_free_kbytes` 128 MB → 256 MB | Increases minimum free memory reserve | Extra headroom prevents direct reclaim stalls under combined ZFS + GPU + browser memory pressure |
+| Journald compression + larger cap | Re-enables compression, raises cap from 100 MB to 250 MB | With compression off and a 100 MB cap, crash-related log bursts were being discarded before they could be analyzed |
+| `amdgpu.gpu_recovery=1` in GRUB | Promotes GPU hang recovery from modprobe.d to kernel cmdline | Ensures the parameter is active from early boot, not just after modprobe.d is processed |
+| ZFS userland version check | Detects and upgrades ZFS userland to match kernel module | Version mismatch between ZFS kmod and userland can cause panics during pool operations |
 
 ### `06-complete-optimization.sh` — Complete Optimization
 
@@ -152,6 +167,7 @@ Second-pass tuning: swap, IRQs, DNS, IOMMU, and hardware-specific platform integ
 | inotify limits | `max_user_instances=1024` | IDEs, Docker, and file watchers all consume inotify instances; the default 128 is too low for development workloads |
 | USB autosuspend | Disables autosuspend for USB audio and video devices | Prevents PipeWire glitches and webcam reconnection issues caused by aggressive 2-second autosuspend |
 | Safety script | `/usr/local/bin/rog-disable-dgpu-pm` | One-command rollback if dGPU runtime PM causes instability |
+| dGPU power profile | Systemd service sets RX 6700S to `3D_FULL_SCREEN` (index 1) on every boot | Default `BOOTUP_DEFAULT` profile limits sustained clocks; `3D_FULL_SCREEN` enables higher sustained frequencies for Chrome rendering, hardware video decode, and display compositing |
 
 ## Usage
 
@@ -166,6 +182,13 @@ sudo bash 03-enhance-system.sh
 sudo bash 04-deep-optimize.sh
 sudo bash 06-complete-optimization.sh
 sudo reboot
+```
+
+### As-needed fixes
+
+```bash
+sudo bash 05-fix-kernel-panic.sh       # After a kernel panic or GPU driver regression
+sudo bash 08-fix-recurring-panic.sh    # After recurring panics (amdgpu+ZFS race conditions)
 ```
 
 Each script creates a timestamped backup of every config file it modifies before making changes.
@@ -183,26 +206,30 @@ bash 07-cleanup.sh
 # Script 01
 zpool status bpool
 mount | grep boot
-cat /sys/module/zfs/parameters/zfs_arc_max        # 8589934592
+cat /sys/module/zfs/parameters/zfs_arc_max        # 6442450944 (6 GB, reduced by script 08)
 
 # Script 02
 cat /proc/sys/net/ipv4/tcp_congestion_control      # bbr
 df /tmp                                             # tmpfs
-cat /sys/kernel/debug/sched/preempt                 # full
-cat /sys/block/nvme0n1/queue/read_ahead_kb          # 0
+cat /sys/kernel/debug/sched/preempt                 # voluntary (changed from full by script 08)
+cat /sys/block/nvme0n1/queue/read_ahead_kb          # 128 (updated by script 06)
 systemd-analyze blame | head -10
 
 # Script 03
 grep mitigations /proc/cmdline                      # mitigations=off
-pw-metadata -n settings 0 | grep quantum            # 512
+pw-metadata -n settings 0 | grep quantum            # 256
 systemctl --user status tracker-miner-fs-3          # masked
+# Chrome (after restarting Chrome):
+#   chrome://gpu → Video Decode: Hardware accelerated
+#   chrome://gpu → OpenGL renderer: AMD Radeon RX 6700S
 
 # Script 04
 swapon --show                                       # zram0 + dm-crypt
 resolvectl status                                   # DoT + Cloudflare
-journalctl --disk-usage                             # ≤100 MB
+journalctl --disk-usage                             # ≤250 MB (raised by script 08)
 grep iommu /proc/cmdline                            # iommu=pt
 cat /sys/class/drm/card1/device/power/runtime_status # suspended (when idle)
+cat /sys/class/drm/card1/device/pp_power_profile_mode | grep '*'  # 3D_FULL_SCREEN*
 sudo rog-profile status
 ```
 
@@ -210,5 +237,7 @@ sudo rog-profile status
 
 | Command | Description |
 |---|---|
-| `sudo rog-profile balanced\|performance\|quiet\|status` | Switch ASUS thermal/fan profile |
+| `sudo rog-profile balanced\|performance\|quiet\|status` | Switch ASUS thermal/fan profile and CPU EPP via power-profiles-daemon |
 | `sudo rog-disable-dgpu-pm` | Emergency rollback: re-disable dGPU runtime PM if system becomes unstable |
+| `set-cpu-epp <mode>` | Manually set CPU energy performance preference for all cores |
+| `systemctl status amdgpu-power-profile` | Check dGPU power profile service (should be active/exited) |

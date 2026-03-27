@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # Deep System Optimization — ASUS ROG Zephyrus G14 (GA402RJ)
-# Ubuntu 24.04.4, Kernel 6.17, ZFS root, AMD Ryzen 9 6900HS + RX 6800S
+# Ubuntu 24.04.4, Kernel 6.17, ZFS root, AMD Ryzen 9 6900HS + RX 6700S
 #
 # Second-pass optimizations covering:
 #   1. ZRAM compressed swap (RAM-speed, replaces NVMe swap as primary)
@@ -447,6 +447,42 @@ echo -e "${YELLOW}[NOTE]${NC} If you experience GPU crashes after reboot, run:"
 echo "       sudo rog-disable-dgpu-pm && sudo reboot"
 
 # =============================================================================
+# 12. dGPU POWER PROFILE — Set RX 6700S to 3D_FULL_SCREEN at boot
+# =============================================================================
+echo ""
+echo "=== 12. dGPU Power Profile Service ==="
+
+# The dGPU defaults to BOOTUP_DEFAULT power profile (index 0), which is
+# conservative and limits sustained clock speeds. 3D_FULL_SCREEN (index 1)
+# provides higher sustained clocks for GPU workloads — Chrome rendering,
+# hardware video decode offload, and display compositing.
+# A oneshot systemd service applies this profile on every boot.
+
+cat > /etc/systemd/system/amdgpu-power-profile.service <<'EOF'
+[Unit]
+Description=Set AMD RX 6700S dGPU to 3D_FULL_SCREEN power profile
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo 1 > /sys/class/drm/card1/device/pp_power_profile_mode'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable amdgpu-power-profile 2>/dev/null && \
+    log "dGPU power profile service enabled (3D_FULL_SCREEN on every boot)" || \
+    warn "Could not enable amdgpu-power-profile service"
+
+# Apply immediately
+if [ -f /sys/class/drm/card1/device/pp_power_profile_mode ]; then
+    echo 1 > /sys/class/drm/card1/device/pp_power_profile_mode 2>/dev/null && \
+        log "3D_FULL_SCREEN profile applied to running system" || true
+fi
+
+# =============================================================================
 # SUMMARY
 # =============================================================================
 echo ""
@@ -473,6 +509,7 @@ echo "   - Intel VA-API module blacklist"
 echo "   - USB autosuspend rules for audio/video"
 echo "   - Auto power-profile udev rules (AC→performance, battery→balanced)"
 echo "   - Auto CPU EPP udev rules"
+echo "   - dGPU power profile: 3D_FULL_SCREEN (higher sustained clocks)"
 echo ""
 echo " New tools:"
 echo "   sudo rog-profile performance  # max performance (AC)"
@@ -488,4 +525,5 @@ echo "   journalctl --disk-usage            # should be ≤100MB"
 echo "   grep iommu /proc/cmdline           # should show iommu=pt"
 echo "   systemctl is-active irqbalance     # should be active"
 echo "   cat /sys/class/drm/card1/device/power/runtime_status  # suspended when idle"
+echo "   cat /sys/class/drm/card1/device/pp_power_profile_mode | grep '*'  # 3D_FULL_SCREEN*"
 echo ""
